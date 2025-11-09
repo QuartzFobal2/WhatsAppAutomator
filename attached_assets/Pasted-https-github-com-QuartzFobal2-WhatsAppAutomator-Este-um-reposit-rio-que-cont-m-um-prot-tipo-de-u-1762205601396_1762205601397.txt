@@ -1,0 +1,102 @@
+https://github.com/QuartzFobal2/WhatsAppAutomator Este é um repositório que contém um protótipo de uma aplicação desktop para um controlador de whatsapp. Ele tem alguns problemas, como (mas não limitado a) estes aqui:
+🔴 PROBLEMAS CRÍTICOS (Impedem uso profissional)
+1. Falta de Persistência de Dados ⚠️ CRÍTICO
+Problema: Os conjuntos de mensagens e mensagens agendadas estão apenas em memória (variáveis locais no electron/main.js e HomeElectron.tsx)
+// electron/main.js - linhas 11-12
+let scheduledMessages = []; // ❌ Perdido ao fechar app
+let schedulerInterval = null;
+// HomeElectron.tsx - linha 25
+const [messageSets, setMessageSets] = useState<SavedMessageSet[]>([]); // ❌ Perdido ao recarregar
+Impacto:
+•	Todos os dados são perdidos quando o app é fechado
+•	Mensagens agendadas desaparecem
+•	Usuário perde todo o trabalho
+Solução:
+•	Implementar persistência com SQLite ou arquivo JSON local
+•	Salvar messageSets em localStorage ou banco de dados
+•	Salvar scheduledMessages em banco de dados
+2. Falta de Upload Real de Arquivos ⚠️ CRÍTICO
+Problema: O MessageSetBuilder.tsx cria mensagens de mídia (imagem, vídeo, áudio), mas não implementa upload de arquivos reais
+// MessageSetBuilder.tsx - linhas 40-42
+content: type === "text" ? "" : `${type}-file.${type === "audio" ? "mp3" : type === "video" ? "mp4" : "jpg"}`,
+fileName: type !== "text" ? `${type}-file.${type === "audio" ? "mp3" : type === "video" ? "mp4" : "jpg"}` : undefined,
+Impacto:
+•	Usuário não consegue realmente adicionar imagens/vídeos/arquivos
+•	Apenas mostra placeholder de nome de arquivo
+•	Funcionalidade de mídia é mock/fake
+Solução:
+•	Adicionar input de arquivo real
+•	Converter arquivos para base64 ou salvar caminho do arquivo
+•	Implementar preview de mídia
+3. Server/Routes Vazios ⚠️ MÉDIO
+Problema: O server/routes.ts está vazio - nenhuma rota implementada
+// server/routes.ts
+export async function registerRoutes(app: Express): Promise<Server> {
+  // put application routes here  ❌ Vazio!
+  const httpServer = createServer(app);
+  return httpServer;
+}
+Impacto:
+•	O servidor Express existe mas não faz nada
+•	Código morto no projeto
+•	Confusão entre arquitetura Electron vs Web
+Solução:
+•	Remover código do servidor se for apenas Electron
+•	OU implementar rotas se quiser versão híbrida
+4. Tratamento de Erros Insuficiente ⚠️ MÉDIO
+Problema: Muitas operações não tratam erros adequadamente
+// electron/main.js - linha 262
+const chat = await whatsappClient.getChatById(contactId); // ❌ Pode falhar se contactId inválido
+await chat.sendMessage(message);
+Impacto:
+•	App pode crashar inesperadamente
+•	Usuário não recebe feedback claro sobre falhas
+•	Difícil debug em produção
+Solução:
+•	Adicionar try-catch em todas operações assíncronas
+•	Validar inputs antes de usar
+•	Retornar mensagens de erro claras
+5. Falta de Validação de Dados ⚠️ MÉDIO
+Problema: Nenhuma validação nos formulários e inputs
+// MessageSetBuilder.tsx - linha 53
+const handleSave = () => {
+  if (onSave && setName) { // ❌ Não valida se setName está vazio ou se messages tem conteúdo
+    onSave(setName, messages);
+  }
+};
+Impacto:
+•	Usuário pode salvar conjunto de mensagens vazio
+•	Pode salvar mensagens sem conteúdo
+•	Dados inconsistentes
+Solução:
+•	Adicionar validação (ex: Zod schema)
+•	Desabilitar botão Save se dados inválidos
+•	Mostrar mensagens de erro claras
+________________________________________
+⚠️ PROBLEMAS MODERADOS
+6. Limite de Contatos Hardcoded
+// electron/main.js - linha 300
+const chats = await whatsappClient.getChats();
+const contacts = await Promise.all(
+  chats.slice(0, 50).map(async (chat) => { // ❌ Limitado a 50 contatos
+Solução: Implementar paginação ou permitir configuração do limite
+7. Performance em Filtros
+// electron/main.js - linha 414
+for (const chat of chats.slice(0, 100)) { // ❌ Busca 10 mensagens para cada um dos 100 chats
+  const messages = await chat.fetchMessages({ limit: 10 });
+Solução: Otimizar com cache ou busca lazy
+8. Falta de Feedback Visual
+•	Não há loading states durante envio de mensagens
+•	Não há confirmação visual de operações concluídas
+•	Progress bar seria útil para envios em massa
+9. Configurações do Puppeteer
+// electron/main.js - linhas 43-53
+puppeteer: {
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage', // ⚠️ Pode causar problemas de memória
+Recomendação: Tornar configurável e adicionar documentação
+
+O seu objetivo é melhorar essa aplicação desktop para viabilizar, por fim, um uso profissional a longo prazo por qualquer entidade e/ou empresa. Você (obviamente) deve primeiro importar o repositório do GitHub e analisar ele para depois usar ele como ponto de partida e iniciar melhorias.

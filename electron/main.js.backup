@@ -1,0 +1,461 @@
+const { app, BrowserWindow, ipcMain } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+
+let mainWindow;
+let whatsappClient;
+let isClientReady = false;
+let qrCodeData = null;
+let scheduledMessages = [];
+let schedulerInterval = null;
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    minWidth: 1000,
+    minHeight: 600,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
+    },
+    title: 'WhatsApp Automation',
+    backgroundColor: '#f8fafc',
+  });
+
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.loadURL('http://localhost:5000');
+    mainWindow.webContents.openDevTools();
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '../dist/public/index.html'));
+  }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+function initializeWhatsApp() {
+  whatsappClient = new Client({
+    authStrategy: new LocalAuth({
+      dataPath: path.join(app.getPath('userData'), 'whatsapp-session'),
+    }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+      ],
+    },
+  });
+
+  whatsappClient.on('qr', (qr) => {
+    console.log('QR Code received');
+    qrcode.generate(qr, { small: true });
+    qrCodeData = qr;
+    if (mainWindow) {
+      mainWindow.webContents.send('whatsapp:qr', qr);
+    }
+  });
+
+  whatsappClient.on('ready', () => {
+    console.log('WhatsApp client is ready!');
+    isClientReady = true;
+    qrCodeData = null;
+    if (mainWindow) {
+      mainWindow.webContents.send('whatsapp:ready');
+    }
+  });
+
+  whatsappClient.on('authenticated', () => {
+    console.log('WhatsApp authenticated');
+    if (mainWindow) {
+      mainWindow.webContents.send('whatsapp:authenticated');
+    }
+  });
+
+  whatsappClient.on('auth_failure', (msg) => {
+    console.error('WhatsApp authentication failure:', msg);
+    if (mainWindow) {
+      mainWindow.webContents.send('whatsapp:auth_failure', msg);
+    }
+  });
+
+  whatsappClient.on('disconnected', (reason) => {
+    console.log('WhatsApp disconnected:', reason);
+    isClientReady = false;
+    if (mainWindow) {
+      mainWindow.webContents.send('whatsapp:disconnected', reason);
+    }
+  });
+
+  whatsappClient.initialize();
+}
+
+app.whenReady().then(() => {
+  createWindow();
+  initializeWhatsApp();
+  startScheduler();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    if (whatsappClient) {
+      whatsappClient.destroy();
+    }
+    if (schedulerInterval) {
+      clearInterval(schedulerInterval);
+    }
+    app.quit();
+  }
+});
+
+// Scheduler for sending messages at scheduled times
+function startScheduler() {
+  schedulerInterval = setInterval(async () => {
+    const now = new Date();
+    const toSend = scheduledMessages.filter(msg => msg.scheduledTime <= now && msg.status === 'pending');
+
+    for (const scheduled of toSend) {
+      try {
+        const results = await sendMessageBatch(scheduled.contactIds, scheduled.messages);
+        
+        const successCount = results.filter(r => r.success).length;
+        const failCount = results.filter(r => !r.success).length;
+        
+        if (failCount === 0) {
+          scheduled.status = 'sent';
+          scheduled.sentTime = new Date();
+          
+          if (mainWindow) {
+            mainWindow.webContents.send('scheduled:sent', scheduled.id, {
+              total: results.length,
+              successful: successCount,
+              failed: failCount,
+            });
+          }
+        } else if (successCount === 0) {
+          scheduled.status = 'failed';
+          scheduled.error = `All ${failCount} messages failed to send`;
+          
+          if (mainWindow) {
+            mainWindow.webContents.send('scheduled:failed', scheduled.id, {
+              total: results.length,
+              successful: successCount,
+              failed: failCount,
+              errors: results.filter(r => !r.success).map(r => r.error),
+            });
+          }
+        } else {
+          scheduled.status = 'partial';
+          scheduled.error = `${failCount} of ${results.length} messages failed`;
+          scheduled.sentTime = new Date();
+          
+          if (mainWindow) {
+            mainWindow.webContents.send('scheduled:partial', scheduled.id, {
+              total: results.length,
+              successful: successCount,
+              failed: failCount,
+              errors: results.filter(r => !r.success).map(r => r.error),
+            });
+          }
+        }
+        
+        scheduled.results = results;
+      } catch (error) {
+        console.error('Error sending scheduled message:', error);
+        scheduled.status = 'failed';
+        scheduled.error = error.message;
+        
+        if (mainWindow) {
+          mainWindow.webContents.send('scheduled:failed', scheduled.id, {
+            total: scheduled.contactIds.length,
+            successful: 0,
+            failed: scheduled.contactIds.length,
+            errors: [error.message],
+          });
+        }
+      }
+    }
+
+    // Keep executed messages in memory for history/retry, but limit to last 100
+    const completedMessages = scheduledMessages.filter(msg => msg.status !== 'pending');
+    if (completedMessages.length > 100) {
+      const sortedCompleted = completedMessages.sort((a, b) => 
+        (b.sentTime || b.scheduledTime).getTime() - (a.sentTime || a.scheduledTime).getTime()
+      );
+      const toRemove = sortedCompleted.slice(100);
+      scheduledMessages = scheduledMessages.filter(msg => !toRemove.includes(msg));
+    }
+  }, 10000); // Check every 10 seconds
+}
+
+async function sendMessageBatch(contactIds, messages) {
+  if (!isClientReady) {
+    throw new Error('WhatsApp client not ready');
+  }
+
+  const results = [];
+
+  for (const contactId of contactIds) {
+    try {
+      const chat = await whatsappClient.getChatById(contactId);
+      
+      for (const message of messages) {
+        if (message.type === 'text') {
+          await chat.sendMessage(message.content);
+        } else if (message.type === 'image' || message.type === 'video' || message.type === 'audio' || message.type === 'file') {
+          if (message.filePath && fs.existsSync(message.filePath)) {
+            const media = MessageMedia.fromFilePath(message.filePath);
+            await chat.sendMessage(media, { caption: message.content || '' });
+          } else if (message.base64Data) {
+            const mimeTypes = {
+              'image': 'image/jpeg',
+              'video': 'video/mp4',
+              'audio': 'audio/mpeg',
+              'file': 'application/pdf',
+            };
+            const media = new MessageMedia(
+              mimeTypes[message.type] || 'application/octet-stream',
+              message.base64Data,
+              message.fileName || `file.${message.type}`
+            );
+            await chat.sendMessage(media, { caption: message.content || '' });
+          } else {
+            console.warn(`Skipping ${message.type} message - no file path or data provided`);
+          }
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+
+      results.push({ contactId, success: true });
+    } catch (error) {
+      console.error(`Error sending to ${contactId}:`, error);
+      results.push({ contactId, success: false, error: error.message });
+    }
+  }
+
+  return results;
+}
+
+// IPC Handlers
+ipcMain.handle('whatsapp:getStatus', async () => {
+  return {
+    isReady: isClientReady,
+    qrCode: qrCodeData,
+  };
+});
+
+ipcMain.handle('whatsapp:getContacts', async () => {
+  if (!isClientReady) {
+    throw new Error('WhatsApp client not ready');
+  }
+
+  try {
+    const chats = await whatsappClient.getChats();
+    const contacts = await Promise.all(
+      chats.slice(0, 50).map(async (chat) => {
+        const contact = await chat.getContact();
+        const messages = await chat.fetchMessages({ limit: 1 });
+        const lastMessage = messages[0];
+
+        return {
+          id: contact.id._serialized,
+          name: contact.name || contact.pushname || contact.number,
+          phone: contact.number,
+          avatar: await contact.getProfilePicUrl().catch(() => undefined),
+          lastMessage: lastMessage?.body || '',
+          lastMessageTime: lastMessage?.timestamp ? new Date(lastMessage.timestamp * 1000) : new Date(),
+          labels: [], // WhatsApp Web.js doesn't expose labels easily
+          isFromMe: lastMessage?.fromMe || false,
+        };
+      })
+    );
+
+    return contacts;
+  } catch (error) {
+    console.error('Error fetching contacts:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('whatsapp:getChatHistory', async (event, contactId) => {
+  if (!isClientReady) {
+    throw new Error('WhatsApp client not ready');
+  }
+
+  try {
+    const chat = await whatsappClient.getChatById(contactId);
+    const messages = await chat.fetchMessages({ limit: 20 });
+
+    return messages.map((msg) => ({
+      id: msg.id._serialized,
+      text: msg.body,
+      timestamp: new Date(msg.timestamp * 1000),
+      isFromMe: msg.fromMe,
+      mediaType: msg.hasMedia ? msg.type : undefined,
+    }));
+  } catch (error) {
+    console.error('Error fetching chat history:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('whatsapp:sendMessage', async (event, contactId, message) => {
+  if (!isClientReady) {
+    throw new Error('WhatsApp client not ready');
+  }
+
+  try {
+    const chat = await whatsappClient.getChatById(contactId);
+    await chat.sendMessage(message);
+    return { success: true };
+  } catch (error) {
+    console.error('Error sending message:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('whatsapp:sendMessages', async (event, contactIds, messages) => {
+  return await sendMessageBatch(contactIds, messages);
+});
+
+ipcMain.handle('whatsapp:scheduleMessages', async (event, contactIds, messages, scheduledTime) => {
+  const scheduled = {
+    id: Date.now().toString(),
+    contactIds,
+    messages,
+    scheduledTime: new Date(scheduledTime),
+    status: 'pending',
+  };
+
+  scheduledMessages.push(scheduled);
+  return { success: true, scheduledId: scheduled.id };
+});
+
+ipcMain.handle('whatsapp:getScheduledMessages', async () => {
+  return scheduledMessages;
+});
+
+ipcMain.handle('whatsapp:cancelScheduled', async (event, scheduledId) => {
+  const index = scheduledMessages.findIndex(msg => msg.id === scheduledId);
+  if (index !== -1) {
+    const msg = scheduledMessages[index];
+    if (msg.status === 'pending') {
+      scheduledMessages.splice(index, 1);
+      return { success: true };
+    } else {
+      return { success: false, error: 'Can only cancel pending messages' };
+    }
+  }
+  return { success: false, error: 'Scheduled message not found' };
+});
+
+ipcMain.handle('whatsapp:retryScheduled', async (event, scheduledId) => {
+  const scheduled = scheduledMessages.find(msg => msg.id === scheduledId);
+  if (!scheduled) {
+    return { success: false, error: 'Scheduled message not found' };
+  }
+  
+  if (scheduled.status === 'pending') {
+    return { success: false, error: 'Message is already pending' };
+  }
+  
+  scheduled.status = 'pending';
+  scheduled.error = undefined;
+  scheduled.sentTime = undefined;
+  scheduled.results = undefined;
+  
+  return { success: true };
+});
+
+ipcMain.handle('whatsapp:clearScheduledHistory', async () => {
+  scheduledMessages = scheduledMessages.filter(msg => msg.status === 'pending');
+  return { success: true };
+});
+
+ipcMain.handle('whatsapp:filterContacts', async (event, criteria) => {
+  if (!isClientReady) {
+    throw new Error('WhatsApp client not ready');
+  }
+
+  try {
+    const chats = await whatsappClient.getChats();
+    const filtered = [];
+
+    for (const chat of chats.slice(0, 100)) {
+      const contact = await chat.getContact();
+      const messages = await chat.fetchMessages({ limit: 10 });
+      
+      let matches = true;
+
+      // Filter by last message text
+      if (criteria.lastMessageText && messages.length > 0) {
+        const hasMatch = messages.some(msg => 
+          msg.body.toLowerCase().includes(criteria.lastMessageText.toLowerCase())
+        );
+        if (!hasMatch) matches = false;
+      }
+
+      // Filter by sender
+      if (criteria.lastMessageSender && criteria.lastMessageSender !== 'any' && messages.length > 0) {
+        const lastMsg = messages[0];
+        if (criteria.lastMessageSender === 'me' && !lastMsg.fromMe) matches = false;
+        if (criteria.lastMessageSender === 'contact' && lastMsg.fromMe) matches = false;
+      }
+
+      // Filter by time
+      if (criteria.lastMessageWithin && messages.length > 0) {
+        const lastMsg = messages[0];
+        const msgTime = new Date(lastMsg.timestamp * 1000);
+        const now = new Date();
+        const diff = now - msgTime;
+
+        const timeRanges = {
+          '1h': 60 * 60 * 1000,
+          '24h': 24 * 60 * 60 * 1000,
+          '7d': 7 * 24 * 60 * 60 * 1000,
+          '30d': 30 * 24 * 60 * 60 * 1000,
+        };
+
+        if (diff > timeRanges[criteria.lastMessageWithin]) {
+          matches = false;
+        }
+      }
+
+      if (matches) {
+        const lastMessage = messages[0];
+        filtered.push({
+          id: contact.id._serialized,
+          name: contact.name || contact.pushname || contact.number,
+          phone: contact.number,
+          avatar: await contact.getProfilePicUrl().catch(() => undefined),
+          lastMessage: lastMessage?.body || '',
+          lastMessageTime: lastMessage?.timestamp ? new Date(lastMessage.timestamp * 1000) : new Date(),
+          labels: [],
+          isFromMe: lastMessage?.fromMe || false,
+        });
+      }
+    }
+
+    return filtered;
+  } catch (error) {
+    console.error('Error filtering contacts:', error);
+    throw error;
+  }
+});

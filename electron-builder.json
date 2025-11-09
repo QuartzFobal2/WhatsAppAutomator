@@ -1,0 +1,29 @@
+{
+  "appId": "com.whatsapp.automation",
+  "productName": "WhatsApp Automation",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "node_modules/whatsapp-web.js",
+      "to": "whatsapp-web.js"
+    }
+  ],
+  "mac": {
+    "category": "public.app-category.productivity",
+    "target": ["dmg", "zip"]
+  },
+  "win": {
+    "target": ["nsis", "portable"]
+  },
+  "linux": {
+    "target": ["AppImage", "deb"],
+    "category": "Utility"
+  }
+}
